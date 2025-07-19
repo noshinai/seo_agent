@@ -1,1 +1,6 @@
 venv/
+static/
+*.json
+__pycache__/
+.env
+/statics

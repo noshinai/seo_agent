@@ -1,7 +1,9 @@
-#!/usr/bin/env python3
-import sys, re, itertools, xml.etree.ElementTree as ET
-from urllib.parse import urlparse
-import requests
+# sitemap_hunter.py
+import re, itertools, xml.etree.ElementTree as ET
+from urllib.parse import urlparse, unquote
+import aiohttp
+import asyncio
+from typing import List
 
 COMMON_CANDIDATES = [
     "/sitemap.xml",
@@ -14,28 +16,25 @@ COMMON_CANDIDATES = [
 HEADERS = {"User-Agent": "SEO-Agent/0.1 (+https://github.com/noshinai/seo-agent)"}
 
 
-def normalize_root(url: str) -> str:
-    """
-    Follow redirects to normalize root domain.
-    """
+async def normalize_root(session: aiohttp.ClientSession, url: str) -> str:
     url = url if "://" in url else f"https://{url}"
     try:
-        r = requests.get(url, headers=HEADERS, timeout=10, allow_redirects=True)
-        parsed = urlparse(r.url)
-        return f"{parsed.scheme}://{parsed.netloc}"
-    except requests.RequestException:
+        async with session.get(url, headers=HEADERS, timeout=10, allow_redirects=True) as r:
+            parsed = urlparse(str(r.url))
+            return f"{parsed.scheme}://{parsed.netloc}"
+    except:
         parsed = urlparse(url)
         return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def get(url: str) -> requests.Response | None:
+async def get(session: aiohttp.ClientSession, url: str) -> aiohttp.ClientResponse | None:
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=10, allow_redirects=True)
-        if resp.ok:
-            return resp
-        else:
-            print(f"⚠️ Failed ({resp.status_code}): {url}")
-    except requests.RequestException as e:
+        async with session.get(url, headers=HEADERS, timeout=10, allow_redirects=True) as resp:
+            if resp.status == 200:
+                return await resp.text()
+            else:
+                print(f"⚠️ Failed ({resp.status}): {url}")
+    except Exception as e:
         print(f"❌ Error fetching {url}: {e}")
     return None
 
@@ -48,31 +47,33 @@ def is_xml(text: str) -> bool:
         return False
 
 
-def try_common(root: str) -> list[str]:
+async def try_common(session: aiohttp.ClientSession, root: str) -> List[str]:
     hits = []
     for path in COMMON_CANDIDATES:
         full = root + path
         print(f"🌐 Trying: {full}")
-        if (r := get(full)) and is_xml(r.text):
+        text = await get(session, full)
+        if text and is_xml(text):
             print(f"✅ Valid sitemap found: {full}")
             hits.append(full)
     return hits
 
 
-def parse_robots(root: str) -> list[str]:
+async def parse_robots(session: aiohttp.ClientSession, root: str) -> List[str]:
     robots_url = root + "/robots.txt"
     print(f"📄 Fetching robots.txt: {robots_url}")
-    resp = get(robots_url)
-    if not resp:
+    text = await get(session, robots_url)
+    if not text:
         print("⚠️ No robots.txt found.")
         return []
 
     sitemaps = []
-    for line in resp.text.splitlines():
+    for line in text.splitlines():
         if line.lower().startswith("sitemap:"):
             sm_url = line.split(":", 1)[1].strip()
             print(f"🔗 Found in robots.txt: {sm_url}")
-            if sm_url and (r := get(sm_url)) and is_xml(r.text):
+            sm_text = await get(session, sm_url)
+            if sm_text and is_xml(sm_text):
                 print(f"✅ Valid sitemap from robots.txt: {sm_url}")
                 sitemaps.append(sm_url)
             else:
@@ -80,70 +81,52 @@ def parse_robots(root: str) -> list[str]:
     return sitemaps
 
 
-def google_search(domain: str, max_hits: int = 10) -> list[str]:
-    """
-    Uses Google's public web interface with simple scraping.
-    Replace with SerpAPI or Google CSE for production use.
-    """
-    import urllib.parse, bs4
+async def google_search(session: aiohttp.ClientSession, domain: str, max_hits: int = 10) -> List[str]:
+    import bs4
 
     query = f"site:{domain} inurl:sitemap"
     params = {"q": query, "num": max_hits}
     try:
-        html = requests.get("https://www.google.com/search", params=params, headers=HEADERS, timeout=10).text
-    except requests.RequestException as e:
+        async with session.get("https://www.google.com/search", params=params, headers=HEADERS, timeout=10) as resp:
+            html = await resp.text()
+    except Exception as e:
         print(f"❌ Google search failed: {e}")
         return []
 
     soup = bs4.BeautifulSoup(html, "html.parser")
     urls = []
-
     for a in soup.select("a"):
         href = a.get("href", "")
         m = re.match(r"/url\?q=(https?[^&]+)", href)
         if m:
-            actual = urllib.parse.unquote(m.group(1))
+            actual = unquote(m.group(1))
             if domain in actual and "sitemap" in actual:
                 urls.append(actual)
 
     clean = []
     for u in itertools.islice(urls, max_hits):
         print(f"🔍 Checking search hit: {u}")
-        if (r := get(u)) and is_xml(r.text):
+        sm_text = await get(session, u)
+        if sm_text and is_xml(sm_text):
             print(f"✅ Valid sitemap from search: {u}")
             clean.append(u)
     return clean
 
 
-def hunt(domain_or_url: str) -> list[str]:
-    root = normalize_root(domain_or_url)
-    print(f"🔍 Hunting sitemaps for: {domain_or_url}")
-    print(f"🔗 Canonical domain resolved: {root}")
+async def hunt(domain_or_url: str) -> List[str]:
+    async with aiohttp.ClientSession() as session:
+        root = await normalize_root(session, domain_or_url)
+        print(f"🔍 Hunting sitemaps for: {domain_or_url}")
+        print(f"🔗 Canonical domain resolved: {root}")
 
-    results: list[str] = []
+        robots_hits = await parse_robots(session, root)
+        common_hits = await try_common(session, root)
+        search_hits = await google_search(session, urlparse(root).netloc)
 
-    robots_hits = parse_robots(root)
-    common_hits = try_common(root)
-    search_hits = google_search(urlparse(root).netloc)
+        # Deduplicate results
+        seen = set()
+        for lst in (robots_hits, common_hits, search_hits):
+            for url in lst:
+                seen.add(url)
 
-    for lst in (robots_hits, common_hits, search_hits):
-        for url in lst:
-            if url not in results:
-                results.append(url)
-    return results
-
-
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: sitemap_hunter.py <domain_or_url>")
-        sys.exit(1)
-
-    domain = sys.argv[1]
-    results = hunt(domain)
-
-    if results:
-        print("\n🎯 Discovered sitemap URLs:")
-        for url in results:
-            print("  ✓", url)
-    else:
-        print("\n❌ No sitemaps found.")
+        return list(seen)

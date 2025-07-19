@@ -1,0 +1,66 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from datetime import datetime, timedelta
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+import os
+
+app = FastAPI()
+
+# Mount the static folder
+app.mount("/static", StaticFiles(directory="static", html=True), name="static")
+
+
+# --- Configuration ---
+SERVICE_ACCOUNT_FILE = 'myndy-463811-7eb8411e62b5.json'  # Replace with path or load from env
+SITE_URL = 'https://www.nytimes.com'              # Replace with your actual site
+
+
+# --- Response Model ---
+class GSCResponseItem(BaseModel):
+    url: str
+    clicks: int
+    impressions: int
+
+
+@app.get("/gsc/top-pages", response_model=list[GSCResponseItem])
+def get_gsc_top_pages():
+    try:
+        # Create credentials
+        credentials = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE,
+            scopes=['https://www.googleapis.com/auth/webmasters.readonly']
+        )
+
+        # Build the service
+        service = build('searchconsole', 'v1', credentials=credentials)
+
+        # Set date range
+        end_date = datetime.today().date()
+        start_date = end_date - timedelta(days=30)
+
+        # Query GSC
+        response = service.searchanalytics().query(
+            siteUrl=SITE_URL,
+            body={
+                "startDate": str(start_date),
+                "endDate": str(end_date),
+                "dimensions": ["page"],
+                "rowLimit": 10
+            }
+        ).execute()
+
+        # Format the response
+        result = []
+        for row in response.get("rows", []):
+            result.append(GSCResponseItem(
+                url=row['keys'][0],
+                clicks=row['clicks'],
+                impressions=row['impressions']
+            ))
+
+        return result
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching data: {str(e)}")
