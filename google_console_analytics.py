@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Query
 from fastapi.responses import RedirectResponse, JSONResponse
 from starlette.config import Config
 from starlette.middleware.sessions import SessionMiddleware
@@ -6,6 +6,7 @@ from google_auth_oauthlib.flow import Flow
 import os
 from dotenv import load_dotenv
 
+from typing import List
 import pathlib
 import requests
 
@@ -21,7 +22,7 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 if not CLIENT_ID or not CLIENT_SECRET:
     raise ValueError("CLIENT_ID and CLIENT_SECRET must be set in environment variables.")
-SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
+SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly", "https://www.googleapis.com/auth/analytics.readonly"]
 REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:8000/oauth2callback")
 
 @app.get("/oauth/login")
@@ -144,68 +145,84 @@ def get_gsc_performance(site: str, request: Request, authorization: str = Header
             "message": str(e)
         }, status_code=500)
 
-# from datetime import datetime, timedelta
 
-# @app.get("/gsc/performance")
-# def get_gsc_performance(site: str, request: Request):
-#     token = request.session.get("token")
-#     if not token:
-#         return JSONResponse({"error": "Not authenticated"}, status_code=401)
+@app.get("/ga4/properties")
+def list_ga4_properties(request: Request, authorization: str = Header(default=None)):
+    token = request.session.get("token")
+    if not token and authorization and authorization.startswith("Bearer "):
+        token = authorization.split("Bearer ")[1]
 
-#     headers = {
-#         "Authorization": f"Bearer {token}",
-#         "Content-Type": "application/json",
-#     }
+    if not token:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
 
-#     end_date = datetime.utcnow().date()
-#     start_date = end_date - timedelta(days=30)
+    headers = {"Authorization": f"Bearer {token}"}
+    response = requests.get("https://analyticsadmin.googleapis.com/v1beta/accountSummaries", headers=headers)
 
-#     payload = {
-#         "startDate": str(start_date),
-#         "endDate": str(end_date),
-#         "dimensions": ["query"],
-#         "rowLimit": 20
-#     }
-
-#     url = f"https://searchconsole.googleapis.com/webmasters/v3/sites/{site}/searchAnalytics/query"
-#     response = requests.post(url, headers=headers, json=payload)
-
-#     if response.status_code == 200:
-#         return response.json()
-#     else:
-#         return JSONResponse({"error": "Failed to fetch performance data", "details": response.json()}, status_code=500)
+    if response.status_code == 200:
+        return response.json()
+    else:
+        return JSONResponse({"error": "Failed to fetch GA accounts", "details": response.json()}, status_code=500)
 
 
-# @app.get("/oauth2callback")
-# def callback(request: Request):
-#     state = request.session.get("state")
-#     flow = Flow.from_client_config(
-#         {
-#             "web": {
-#                 "client_id": CLIENT_ID,
-#                 "client_secret": CLIENT_SECRET,
-#                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-#                 "token_uri": "https://oauth2.googleapis.com/token",
-#             }
-#         },
-#         scopes=SCOPES,
-#         state=state,
-#         redirect_uri=REDIRECT_URI
-#     )
 
-#     flow.fetch_token(authorization_response=str(request.url))
-#     credentials = flow.credentials
+def parse_date_param(date_str: str):
+    try:
+        if date_str.lower() == "today":
+            return datetime.utcnow().strftime("%Y-%m-%d")
+        elif date_str.lower().endswith("daysago"):
+            days = int(date_str.lower().replace("daysago", ""))
+            return (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+        else:
+            datetime.strptime(date_str, "%Y-%m-%d")  # validate format
+            return date_str
+    except Exception:
+        raise ValueError("Date must be 'YYYY-MM-DD', 'today' or '<n>daysAgo'")
+    
 
-#     access_token = credentials.token
-#     # request.session["token"] = access_token
-#     return {"message": "Authentication successful. Token stored.", "token": access_token}
+@app.get("/ga4/report")
+def get_ga4_report(
+    request: Request,
+    property_id: str = Query(...),  # GA4 property ID
+    start_date: str = Query(default="30daysAgo"),
+    end_date: str = Query(default="today"),
+    metrics: List[str] = Query(default=["sessions"]),
+    dimensions: List[str] = Query(default=["date"]),
+    authorization: str = Header(default=None)
+):
+    try:
+        start_date = parse_date_param(start_date)
+        end_date = parse_date_param(end_date)
+    except ValueError as ve:
+        return JSONResponse({"error": str(ve)}, status_code=400)
+    
 
-# @app.get("/gsc/sites")
-# def list_sites(request: Request):
-#     token = request.session.get("token")
-#     if not token:
-#         return {"error": "Not authenticated"}
+    token = request.session.get("token")
+    if not token and authorization and authorization.startswith("Bearer "):
+        token = authorization.split("Bearer ")[1]
 
-#     headers = {"Authorization": f"Bearer {token}"}
-#     res = requests.get("https://searchconsole.googleapis.com/webmasters/v3/sites", headers=headers)
-#     return res.json()
+    if not token:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    url = f"https://analyticsdata.googleapis.com/v1beta/properties/{property_id}:runReport"
+
+    payload = {
+        "dateRanges": [{"startDate": start_date, "endDate": end_date}],
+        "metrics": [{"name": m} for m in metrics],
+        "dimensions": [{"name": d} for d in dimensions]
+    }
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+
+    if response.status_code == 200:
+        return response.json()
+    else:
+        return JSONResponse({
+            "error": "Failed to fetch GA4 report",
+            "status_code_from_google": response.status_code,
+            "details": response.json()
+        }, status_code=500)
