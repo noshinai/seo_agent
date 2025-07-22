@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Query
+from fastapi import FastAPI, Request, Query, Header
 from fastapi.responses import RedirectResponse, JSONResponse
 from starlette.config import Config
 from starlette.middleware.sessions import SessionMiddleware
@@ -8,7 +8,11 @@ from dotenv import load_dotenv
 
 from typing import List
 import pathlib
+from datetime import datetime, timedelta
+import logging
 import requests
+import urllib.parse
+from typing import List, Optional
 
 app = FastAPI()
 load_dotenv()
@@ -22,7 +26,11 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 if not CLIENT_ID or not CLIENT_SECRET:
     raise ValueError("CLIENT_ID and CLIENT_SECRET must be set in environment variables.")
-SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly", "https://www.googleapis.com/auth/analytics.readonly"]
+SCOPES = [
+    "https://www.googleapis.com/auth/webmasters",
+    "https://www.googleapis.com/auth/webmasters.readonly",
+    "https://www.googleapis.com/auth/analytics.readonly"
+]
 REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:8000/oauth2callback")
 
 @app.get("/oauth/login")
@@ -87,13 +95,21 @@ def oauth_callback(request: Request):
         return JSONResponse({"error": "Failed to fetch GSC data", "details": response.json()}, status_code=500)
 
 
-from fastapi import Header
-from datetime import datetime, timedelta
-import logging
-import urllib.parse
+
 
 @app.get("/gsc/performance")
-def get_gsc_performance(site: str, request: Request, authorization: str = Header(default=None)):
+def get_gsc_performance(
+    site: str, 
+    request: Request,
+    authorization: str = Header(default=None),
+    start_date: str = Query(default=None),
+    end_date: str = Query(default=None),
+    dimensions: Optional[List[str]] = Query(default=["query"]),
+    row_limit: Optional[int] = Query(default=20)):
+
+    if not site:
+        return JSONResponse({"error": "Site parameter is required"}, status_code=400)
+
     token = request.session.get("token")
     if not token and authorization and authorization.startswith("Bearer "):
         token = authorization.split("Bearer ")[1]
@@ -106,14 +122,34 @@ def get_gsc_performance(site: str, request: Request, authorization: str = Header
         "Content-Type": "application/json",
     }
 
-    end_date = datetime.utcnow().date()
-    start_date = end_date - timedelta(days=30)
+    # Parse and validate dates
+    try:
+        if not end_date:
+            end_date = datetime.utcnow().date()
+        else:
+            end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
+
+        if not start_date:
+            start_date = end_date - timedelta(days=30)
+        else:
+            start_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+    except ValueError:
+        return JSONResponse({"error": "Invalid date format. Use YYYY-MM-DD."}, status_code=400)
+
+    if start_date > end_date:
+        return JSONResponse({"error": "Start date cannot be after end date."}, status_code=400)
+    
+    # Validate dimensions
+    allowed_dimensions = {"query", "page", "device", "country", "date"}
+    invalid_dimensions = [d for d in dimensions if d not in allowed_dimensions]
+    if invalid_dimensions:
+        return JSONResponse({"error": f"Invalid dimensions: {invalid_dimensions}"}, status_code=400)
 
     payload = {
         "startDate": str(start_date),
         "endDate": str(end_date),
-        "dimensions": ["query"],
-        "rowLimit": 20
+        "dimensions": dimensions,
+        "rowLimit": row_limit
     }
 
     site = site.rstrip("/")
